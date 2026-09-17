@@ -1,0 +1,28 @@
+---
+name: 🔍 C++ Analysis CI
+
+on:
+  push:
+    branches: [main, 'release/*']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cpp-analysis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-cppcheck:
+    name: Test C++ Static Analysis (Cppcheck)
+    uses: N3b3x/hf-general-ci-tools/.github/workflows/ru-cpp-analysis.yml@main
+    with:
+      paths: "inc"
+      std: "c++17"
+      enable: "warning,style,performance,portability,information"
+      force: true
+      strict: false

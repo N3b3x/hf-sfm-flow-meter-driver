@@ -1,0 +1,7 @@
+// Auto-generated header. Do not edit manually.
+#pragma once
+
+#define HF_SFM_VERSION_MAJOR @HF_SFM_VERSION_MAJOR@
+#define HF_SFM_VERSION_MINOR @HF_SFM_VERSION_MINOR@
+#define HF_SFM_VERSION_PATCH @HF_SFM_VERSION_PATCH@
+#define HF_SFM_VERSION_STRING "@HF_SFM_VERSION_STRING@"

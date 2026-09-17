@@ -1,0 +1,49 @@
+# Build / cache directories
+build/
+builds/
+.cache/
+.idf/
+.devcontainer/.cache/
+node_modules/
+_site/
+.jekyll-cache/
+.jekyll-metadata
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+*.swp
+*.swo
+*.bak
+*.tmp
+.DS_Store
+
+# Doxygen-generated output (do not commit)
+docs/html/
+docs/latex/
+docs/xml/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Python venvs
+.venv/
+venv/
+
+# Compiled / tooling
+*.d
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.elf
+*.bin
+*.map
+*.lst
