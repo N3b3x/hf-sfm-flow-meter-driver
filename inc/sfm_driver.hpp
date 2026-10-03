@@ -1,13 +1,16 @@
 /**
  * @file sfm_driver.hpp
- * @brief Sensirion SF06-family flow-meter I2C client (SFM4300 data sheet §4).
+ * @brief Sensirion flow-meter I2C client: SF06 (SFM4300 data sheet §4) and
+ *        SFx6000 (SFM6000D, SFC6xxx/SFM6xxx I2C interface reference v1.1).
  *
- * @details Implements the SF06 command set: start/stop continuous measurement
- *          per gas or binary mixture, single-frame read of flow + temperature +
- *          status, averaging configuration, concentration update, scale/offset/
- *          unit query, sleep, product identifier, and general-call soft reset.
- *          Every received 16-bit word is CRC-8 checked; every argument word is
- *          sent with its CRC-8.
+ * @details Start/stop continuous measurement per gas or binary mixture,
+ *          single-frame read, concentration update, scale/offset/unit query,
+ *          product identifier and general-call soft reset on both families;
+ *          averaging and sleep on SF06; temperature through the output-buffer
+ *          pointer on SFx6000. The family is learned from the product
+ *          identifier (or given by the caller) and decides which start code
+ *          means which gas. Every received 16-bit word is CRC-8 checked; every
+ *          argument word is sent with its CRC-8.
  *
  *          Typical session:
  *          @code
@@ -41,9 +44,11 @@ public:
     /**
      * @param i2c     Transport adapter (must outlive the driver).
      * @param address 7-bit device address (default SFM4300 0x2A).
+     * @param family  Family assumed until the product identifier is read.
      */
-    explicit Driver(I2cT& i2c, uint8_t address = addr::kSfm4300Default) noexcept
-        : i2c_(i2c), address_(address) {}
+    explicit Driver(I2cT& i2c, uint8_t address = addr::kSfm4300Default,
+                    Family family = Family::Sf06) noexcept
+        : i2c_(i2c), address_(address), family_(family) {}
 
     uint8_t Address() const noexcept { return address_; }
     void SetAddress(uint8_t address) noexcept { address_ = address; }
@@ -51,7 +56,15 @@ public:
     /// Variant learned from the last successful `ReadProductIdentifier()`.
     Variant KnownVariant() const noexcept { return variant_; }
     /// Let the caller assert a variant when the identifier cannot be read (already measuring).
-    void AssumeVariant(Variant v) noexcept { variant_ = v; }
+    void AssumeVariant(Variant v) noexcept {
+        variant_ = v;
+        if (v != Variant::Unknown) {
+            family_ = FamilyOf(v);
+        }
+    }
+
+    /// Family in use (from the identifier, `AssumeVariant`, or the constructor).
+    Family PartFamily() const noexcept { return family_; }
 
     /// Gas selected by the last successful `StartContinuous()`.
     Gas ActiveGas() const noexcept { return active_gas_; }
@@ -85,6 +98,9 @@ public:
         }
         info.variant = VariantFromProductId(info.product_id);
         variant_ = info.variant;
+        if (variant_ != Variant::Unknown) {
+            family_ = FamilyOf(variant_);
+        }
         return DriverResult<ProductInfo>::success(info);
     }
 
@@ -98,11 +114,21 @@ public:
         if (!i2c_.EnsureInitialized()) {
             return DriverResult<Scaling>::failure(DriverError::NotInitialized);
         }
-        if (!WriteCommandWithArg(cmd::kReadScaleOffsetUnit, StartCommandFor(g))) {
+        const uint16_t start = StartCommandFor(family_, g);
+        if (start == 0U) {
+            return DriverResult<Scaling>::failure(DriverError::UnsupportedGas);
+        }
+        if (!WriteCommandWithArg(cmd::kReadScaleOffsetUnit, start)) {
             return DriverResult<Scaling>::failure(DriverError::BusWrite);
         }
-        uint16_t words[3]{};
-        const DriverError err = ReadWords(words, 3);
+        /* SFx6000: the parameters sit behind an output-buffer pointer and
+         * include full-scale flow and the SEMI gas ID (reference §3.3.12). */
+        const bool sfx = (family_ == Family::Sfx6000);
+        if (sfx && !WriteCommand(cmd::kSfx6000PointerGasInfo)) {
+            return DriverResult<Scaling>::failure(DriverError::BusWrite);
+        }
+        uint16_t words[5]{};
+        const DriverError err = ReadWords(words, sfx ? 5 : 3);
         if (err != DriverError::None) {
             return DriverResult<Scaling>::failure(err);
         }
@@ -110,6 +136,10 @@ public:
         s.scale = static_cast<int16_t>(words[0]);
         s.offset = static_cast<int16_t>(words[1]);
         s.unit = words[2];
+        if (sfx) {
+            s.full_scale_raw = static_cast<int16_t>(words[3]);
+            s.gas_id = words[4];
+        }
         s.valid = (s.scale != 0);
         return DriverResult<Scaling>::success(s);
     }
@@ -128,6 +158,11 @@ public:
         if (!i2c_.EnsureInitialized()) {
             return DriverResult<void>::failure(DriverError::NotInitialized);
         }
+        if (variant_ == Variant::Unknown && GasNeedsKnownFamily(g)) {
+            /* The start code for this gas means another gas on the other
+             * family: read the identifier (or AssumeVariant) first. */
+            return DriverResult<void>::failure(DriverError::VariantUnknown);
+        }
         if (!SupportsGas(variant_, g)) {
             return DriverResult<void>::failure(DriverError::UnsupportedGas);
         }
@@ -138,8 +173,9 @@ public:
         if (!sc.ok()) {
             return DriverResult<void>::failure(sc.error);
         }
-        const bool ok = IsMixture(g) ? WriteCommandWithArg(StartCommandFor(g), o2_permille)
-                                     : WriteCommand(StartCommandFor(g));
+        const uint16_t start = StartCommandFor(family_, g);
+        const bool ok = IsMixture(g) ? WriteCommandWithArg(start, o2_permille)
+                                     : WriteCommand(start);
         if (!ok) {
             return DriverResult<void>::failure(DriverError::BusWrite);
         }
@@ -169,18 +205,64 @@ public:
      * (no fresh sample yet, or idle) is reported as `DriverError::NoData`.
      */
     DriverResult<Measurement> ReadMeasurement() noexcept {
+        uint8_t rx[9]{};
+        if (!i2c_.Read(address_, rx, sizeof(rx))) {
+            return DriverResult<Measurement>::failure(DriverError::NoData);
+        }
+        return DecodeMeasurement(family_, scaling_, rx);
+    }
+
+    /**
+     * @brief Decode one 9-byte continuous-mode frame (3 × word + CRC).
+     * @details Pure: the same decode serves the blocking read above and an
+     *          interrupt / DMA reader that fetched the frame itself.
+     *          SF06: flow, temperature, status. SFx6000: flow, reserved,
+     *          status (temperature through `ReadTemperature()`).
+     */
+    static DriverResult<Measurement> DecodeMeasurement(Family family, const Scaling& scaling,
+                                                       const uint8_t frame[9]) noexcept {
         uint16_t words[3]{};
-        const DriverError err = ReadWords(words, 3);
+        const DriverError err = DecodeWords(frame, 3, words);
         if (err != DriverError::None) {
             return DriverResult<Measurement>::failure(err);
         }
         Measurement m{};
         m.flow_raw = static_cast<int16_t>(words[0]);
-        m.temperature_raw = static_cast<int16_t>(words[1]);
         m.status.raw = words[2];
-        m.flow = scaling_.valid ? scaling_.ToFlow(m.flow_raw) : 0.0f;
-        m.temperature_c = static_cast<float>(m.temperature_raw) / kTemperatureScalePerC;
+        m.flow = scaling.valid ? scaling.ToFlow(m.flow_raw) : 0.0f;
+        if (family == Family::Sfx6000) {
+            /* Word 2 is reserved on SFx6000; temperature has its own read. */
+            m.temperature_valid = false;
+        } else {
+            m.temperature_raw = static_cast<int16_t>(words[1]);
+            m.temperature_c = static_cast<float>(m.temperature_raw) / kTemperatureScalePerC;
+        }
         return DriverResult<Measurement>::success(m);
+    }
+
+    /**
+     * @brief SFx6000: read the flow-chip temperature while measuring
+     *        (pointer 0xE102 → one word → pointer back to results 0xE000).
+     * @return `NotSupported` on SF06 (temperature is in every frame).
+     */
+    DriverResult<float> ReadTemperature() noexcept {
+        if (family_ != Family::Sfx6000) {
+            return DriverResult<float>::failure(DriverError::NotSupported);
+        }
+        if (!WriteCommand(cmd::kSfx6000PointerTemperature)) {
+            return DriverResult<float>::failure(DriverError::BusWrite);
+        }
+        uint16_t word[1]{};
+        const DriverError err = ReadWords(word, 1);
+        const bool back = WriteCommand(cmd::kSfx6000PointerResult);
+        if (err != DriverError::None) {
+            return DriverResult<float>::failure(err);
+        }
+        if (!back) {
+            return DriverResult<float>::failure(DriverError::BusWrite);
+        }
+        return DriverResult<float>::success(static_cast<float>(static_cast<int16_t>(word[0])) /
+                                            kTemperatureScalePerC);
     }
 
     /// Flow-only read (2 words + CRC) for the tightest loop; status not refreshed.
@@ -199,6 +281,9 @@ public:
      * @param window 0 = average-until-read (default), 1…128 = fixed-N.
      */
     DriverResult<void> ConfigureAveraging(uint16_t window) noexcept {
+        if (family_ == Family::Sfx6000) {
+            return DriverResult<void>::failure(DriverError::NotSupported);
+        }
         if (window > timing::kMaxAveragingWindow) {
             return DriverResult<void>::failure(DriverError::InvalidParameter);
         }
@@ -234,6 +319,9 @@ public:
 
     /// Enter sleep (idle mode only, §4.3.8).
     DriverResult<void> EnterSleep() noexcept {
+        if (family_ == Family::Sfx6000) {
+            return DriverResult<void>::failure(DriverError::NotSupported);
+        }
         if (!i2c_.EnsureInitialized()) {
             return DriverResult<void>::failure(DriverError::NotInitialized);
         }
@@ -246,6 +334,9 @@ public:
      * Polls up to ~20 ms until the address is acknowledged again.
      */
     DriverResult<void> ExitSleep() noexcept {
+        if (family_ == Family::Sfx6000) {
+            return DriverResult<void>::failure(DriverError::NotSupported);
+        }
         if (!i2c_.EnsureInitialized()) {
             return DriverResult<void>::failure(DriverError::NotInitialized);
         }
@@ -273,7 +364,8 @@ public:
         }
         measuring_ = false;
         scaling_ = Scaling{};
-        i2c_.DelayMs(timing::kSoftResetMs);
+        i2c_.DelayMs(family_ == Family::Sfx6000 ? timing::kSfx6000SoftResetMs
+                                                : timing::kSoftResetMs);
         return DriverResult<void>::success();
     }
 
@@ -326,6 +418,7 @@ private:
 
     I2cT& i2c_;
     uint8_t address_;
+    Family family_{Family::Sf06};
     Variant variant_{Variant::Unknown};
     Gas active_gas_{Gas::Air};
     Scaling scaling_{};

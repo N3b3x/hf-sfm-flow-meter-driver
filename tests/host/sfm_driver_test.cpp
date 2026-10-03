@@ -88,6 +88,10 @@ void TestProductIdentifier() {
     CHECK(i2c.writes[0].bytes[0] == 0xE1 && i2c.writes[0].bytes[1] == 0x02);
     CHECK(sfm::FullScaleSlm(r.value.variant) == 20.0f);
     CHECK(sfm::VariantFromProductId(0x04030615U) == sfm::Variant::Sfm4300_50_P);
+    // Revision byte ignored: an SFM4300-20-P on the 2026-10-02 bench read 0x04030301.
+    CHECK(sfm::VariantFromProductId(0x04030301U) == sfm::Variant::Sfm4300_20_P);
+    CHECK(sfm::VariantFromProductId(0x04030110U) == sfm::Variant::Sfm4300_20_B);
+    CHECK(sfm::VariantFromProductId(0x04030401U) == sfm::Variant::Unknown);
 }
 
 void TestStartAndMeasure() {
@@ -120,7 +124,8 @@ void TestStartAndMeasure() {
     CHECK(m.value.temperature_c > 23.49f && m.value.temperature_c < 23.51f);
     CHECK(m.value.status.pure_gas());
     CHECK(!m.value.status.fixed_n_averaging());
-    CHECK(sfm::GasFromStatusNibble(m.value.status.command_nibble()) == sfm::Gas::CO2);
+    CHECK(sfm::GasFromStatusNibble(sfm::Family::Sf06, m.value.status.command_nibble()) ==
+          sfm::Gas::CO2);
 
     // NACK while no data
     i2c.nack_reads = true;
@@ -171,9 +176,109 @@ void TestAveragingStopReset() {
     CHECK(i2c.delayed_ms >= sfm::timing::kSoftResetMs);
 }
 
+// --- SFx6000 (SFM6000D) ------------------------------------------------------
+
+void TestSfx6000Identity() {
+    FakeI2c i2c;
+    sfm::Driver<FakeI2c> dev(i2c, sfm::addr::kSfm6000Default);
+    CHECK(dev.PartFamily() == sfm::Family::Sf06);  // constructor default until identified
+    // SFM6000D-50, revision 0x84
+    i2c.QueueWords({0x0602, 0x1184, 0x0000, 0x0000, 0x2341, 0x0001});
+    const auto r = dev.ReadProductIdentifier();
+    CHECK(r.ok());
+    CHECK(r.value.variant == sfm::Variant::Sfm6000D_50);
+    CHECK(dev.PartFamily() == sfm::Family::Sfx6000);
+    CHECK(sfm::FullScaleSlm(sfm::Variant::Sfm6000D_20) == 20.0f);
+    CHECK(sfm::VariantFromProductId(0x06021484U) == sfm::Variant::Sfm6000D_5);
+    CHECK(sfm::VariantFromProductId(0x06020184U) == sfm::Variant::Unknown);  // SFC controller
+    CHECK(i2c.writes[0].addr == 0x24);
+}
+
+/* The hazard this layer exists for: 0x3615 / 0x361E mean opposite gases. */
+void TestSfx6000GasMapAndScaling() {
+    CHECK(sfm::StartCommandFor(sfm::Family::Sf06, sfm::Gas::CO2) == 0x361E);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sfx6000, sfm::Gas::CO2) == 0x3615);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sf06, sfm::Gas::N2O) == 0x3615);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sfx6000, sfm::Gas::N2O) == 0x361E);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sfx6000, sfm::Gas::Ar) == 0x3624);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sf06, sfm::Gas::Ar) == 0);
+    CHECK(sfm::StartCommandFor(sfm::Family::Sfx6000, sfm::Gas::CO2O2Mix) == 0);
+
+    FakeI2c i2c;
+    sfm::Driver<FakeI2c> dev(i2c, sfm::addr::kSfm6000Default);
+    dev.AssumeVariant(sfm::Variant::Sfm6000D_50);
+    // CO2 table on the 50 slm part: scale 2560, offset -28672, slm, FS 20 slm, gas id 0x0019
+    const int16_t fs_raw = static_cast<int16_t>(20 * 2560 - 28672);
+    i2c.QueueWords({2560, static_cast<uint16_t>(-28672), sfm::kFlowUnitSlm20C,
+                    static_cast<uint16_t>(fs_raw), 0x0019});
+    const auto s = dev.StartContinuous(sfm::Gas::CO2);
+    CHECK(s.ok());
+    // writes: [0x3661 + 0x3615 + crc], [0xE151 pointer], [0x3615 start]
+    CHECK(i2c.writes.size() == 3);
+    CHECK(i2c.writes[0].bytes[0] == 0x36 && i2c.writes[0].bytes[1] == 0x61);
+    CHECK(i2c.writes[0].bytes[2] == 0x36 && i2c.writes[0].bytes[3] == 0x15);
+    CHECK(i2c.writes[1].bytes.size() == 2 && i2c.writes[1].bytes[0] == 0xE1 &&
+          i2c.writes[1].bytes[1] == 0x51);
+    CHECK(i2c.writes[2].bytes[0] == 0x36 && i2c.writes[2].bytes[1] == 0x15);
+    CHECK(dev.ActiveScaling().gas_id == 0x0019);
+    const float fs = dev.ActiveScaling().FullScaleFlow();
+    CHECK(fs > 19.999f && fs < 20.001f);
+
+    // 5 slm CO2: raw = 5*2560 - 28672; word 2 reserved; status nibble 0b0010 = CO2
+    const int16_t raw = static_cast<int16_t>(5 * 2560 - 28672);
+    const uint16_t status = static_cast<uint16_t>((0x2U << 12) | sfm::kStatusPureGasFraction);
+    i2c.QueueWords({static_cast<uint16_t>(raw), 0xBEEF, status});
+    const auto m = dev.ReadMeasurement();
+    CHECK(m.ok());
+    CHECK(m.value.flow > 4.999f && m.value.flow < 5.001f);
+    CHECK(!m.value.temperature_valid);
+    CHECK(sfm::GasFromStatusNibble(sfm::Family::Sfx6000, m.value.status.command_nibble()) ==
+          sfm::Gas::CO2);
+    CHECK(sfm::GasFromStatusNibble(sfm::Family::Sf06, m.value.status.command_nibble()) ==
+          sfm::Gas::N2O);  // what an SF06 decoder would wrongly have said
+
+    // Temperature: pointer 0xE102, one word, pointer back 0xE000
+    const std::size_t w0 = i2c.writes.size();
+    i2c.QueueWords({static_cast<uint16_t>(30 * 200)});
+    const auto t = dev.ReadTemperature();
+    CHECK(t.ok() && t.value > 29.99f && t.value < 30.01f);
+    CHECK(i2c.writes.size() == w0 + 2);
+    CHECK(i2c.writes[w0].bytes[0] == 0xE1 && i2c.writes[w0].bytes[1] == 0x02);
+    CHECK(i2c.writes[w0 + 1].bytes[0] == 0xE0 && i2c.writes[w0 + 1].bytes[1] == 0x00);
+}
+
+void TestSfx6000Gating() {
+    FakeI2c i2c;
+    sfm::Driver<FakeI2c> dev(i2c, sfm::addr::kSfm6000Default);
+    // Identity unknown: CO2 refused (its code is N2O on the other family).
+    const auto r = dev.StartContinuous(sfm::Gas::CO2);
+    CHECK(!r.ok() && r.error == sfm::DriverError::VariantUnknown);
+    CHECK(i2c.writes.empty());
+    CHECK(sfm::SupportsGas(sfm::Variant::Unknown, sfm::Gas::Air));
+    CHECK(!sfm::SupportsGas(sfm::Variant::Unknown, sfm::Gas::AirO2Mix));
+    CHECK(sfm::SupportsGas(sfm::Variant::Sfm6000D_50, sfm::Gas::Ar));
+    CHECK(!sfm::SupportsGas(sfm::Variant::Sfm6000D_50, sfm::Gas::CO2O2Mix));
+    CHECK(!sfm::SupportsGas(sfm::Variant::Sfm4300_20_P, sfm::Gas::Ar));
+
+    dev.AssumeVariant(sfm::Variant::Sfm6000D_50);
+    const auto avg = dev.ConfigureAveraging(4);
+    CHECK(!avg.ok() && avg.error == sfm::DriverError::NotSupported);
+    CHECK(!dev.EnterSleep().ok());
+    CHECK(dev.SoftReset().ok());
+    CHECK(i2c.delayed_ms >= sfm::timing::kSfx6000SoftResetMs);
+    // SF06 has no separate temperature read.
+    FakeI2c i2c2;
+    sfm::Driver<FakeI2c> sf06(i2c2);
+    const auto t = sf06.ReadTemperature();
+    CHECK(!t.ok() && t.error == sfm::DriverError::NotSupported);
+}
+
 }  // namespace
 
 int main() {
+    TestSfx6000Identity();
+    TestSfx6000GasMapAndScaling();
+    TestSfx6000Gating();
     TestCrc();
     TestProductIdentifier();
     TestStartAndMeasure();
